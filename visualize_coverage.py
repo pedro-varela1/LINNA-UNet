@@ -78,6 +78,109 @@ def get_image_bounds(lat_map, lon_map):
     }
     return bounds
 
+def visualize_all_coverage(dataset_root):
+    """
+    Cria visualizações 3D mostrando todas as regiões do dataset cobertas na Lua.
+    Gera múltiplas visões com diferentes ângulos.
+    """
+    # 1. Carregar arquivos
+    exr_files = sorted(glob.glob(os.path.join(dataset_root, "lat_lon_exr", "*.exr")))
+    alt_files = sorted(glob.glob(os.path.join(dataset_root, "altimeter", "*.txt")))
+    
+    if not exr_files or not alt_files:
+        print("❌ Erro: Dataset não encontrado ou incompleto!")
+        return
+    
+    # Usar apenas arquivos correspondentes
+    exr_dict = {os.path.splitext(os.path.basename(f))[0]: f for f in exr_files}
+    alt_dict = {os.path.splitext(os.path.basename(f))[0]: f for f in alt_files}
+    
+    common_names = sorted(set(exr_dict.keys()) & set(alt_dict.keys()))
+    
+    print("=" * 60)
+    print(f"📊 VISUALIZANDO COBERTURA COMPLETA DO DATASET")
+    print(f"   Total de amostras: {len(common_names)}")
+    print("=" * 60)
+    
+    # Definir múltiplas visões (elevação, azimute)
+    views = [
+        (20, 0, "Visão Frontal"),
+        (20, 90, "Visão Lateral Direita"),
+        (20, 180, "Visão Traseira"),
+        (20, 270, "Visão Lateral Esquerda"),
+        (90, 0, "Visão Polo Norte"),
+        (-90, 0, "Visão Polo Sul")
+    ]
+    
+    for view_idx, (elev, azim, view_name) in enumerate(views):
+        print(f"\n🎨 Gerando {view_name}...")
+        
+        fig = plt.figure(figsize=(16, 16))
+        ax = fig.add_subplot(111, projection='3d')
+        
+        # Criar esfera base (Lua) em cinza claro
+        x_sphere, y_sphere, z_sphere = create_sphere(MOON_RADIUS_KM, resolution=100)
+        ax.plot_surface(x_sphere, y_sphere, z_sphere, color='lightgray', alpha=0.2, 
+                       edgecolor='none', linewidth=0)
+        
+        # Processar todas as amostras
+        for idx, sample_name in enumerate(common_names):
+            if idx % 1000 == 0:
+                print(f"   Processando amostra {idx}/{len(common_names)}...")
+            
+            exr_path = exr_dict[sample_name]
+            alt_path = alt_dict[sample_name]
+            
+            # Carregar dados
+            lat_map, lon_map = read_exr_channels(exr_path)
+            
+            with open(alt_path, 'r') as f:
+                altitude = float(f.read().strip())
+            
+            # Subsampling para não sobrecarregar a visualização
+            step = max(1, lat_map.shape[0] // 20)
+            lat_sub = lat_map[::step, ::step]
+            lon_sub = lon_map[::step, ::step]
+            
+            # Converter pontos da imagem para coordenadas cartesianas
+            x_img, y_img, z_img = latlon_to_cartesian(lat_sub, lon_sub, altitude)
+            
+            # Plotar a região coberta em verde
+            ax.plot_surface(x_img, y_img, z_img, color='green', alpha=0.7, 
+                           edgecolor='none', linewidth=0)
+        
+        # Configurar visualização
+        ax.set_xlabel('X (km)', fontsize=14, fontweight='bold')
+        ax.set_ylabel('Y (km)', fontsize=14, fontweight='bold')
+        ax.set_zlabel('Z (km)', fontsize=14, fontweight='bold')
+        ax.set_title(f'Cobertura Completa do Dataset - {view_name}\n{len(common_names)} regiões', 
+                    fontsize=16, fontweight='bold')
+        
+        # Ajustar limites dos eixos
+        max_range = MOON_RADIUS_KM * 1.2
+        ax.set_xlim([-max_range, max_range])
+        ax.set_ylim([-max_range, max_range])
+        ax.set_zlim([-max_range, max_range])
+        
+        # Aspecto igual
+        ax.set_box_aspect([1, 1, 1])
+        
+        # Ajustar ângulo de visualização
+        ax.view_init(elev=elev, azim=azim)
+        
+        plt.tight_layout()
+        
+        # Salvar figura
+        output_path = f"coverage_all_view_{view_idx+1}_{view_name.replace(' ', '_').lower()}.png"
+        plt.savefig(output_path, dpi=200, bbox_inches='tight')
+        print(f"   ✅ Salvo: {output_path}")
+        
+        plt.close(fig)
+    
+    print("\n" + "=" * 60)
+    print(f"✅ Todas as visualizações foram geradas com sucesso!")
+    print("=" * 60)
+
 def visualize_moon_coverage(dataset_root, sample_idx=0):
     """
     Cria uma visualização 3D mostrando a região da Lua coberta por uma imagem.
@@ -206,10 +309,12 @@ def main():
     import argparse
     
     parser = argparse.ArgumentParser(description='Visualizar cobertura esférica de imagem lunar')
-    parser.add_argument('--dataset', type=str, default='./dataset/LunarLanding_Dataset',
+    parser.add_argument('--dataset', type=str, default='../LINNA-Crater/LunarLanding_Dataset/LunarLanding_Dataset',
                         help='Caminho para o dataset')
     parser.add_argument('--sample', type=int, default=10000,
                         help='Índice da amostra a visualizar (padrão: 10000)')
+    parser.add_argument('--all', action='store_true',
+                        help='Visualizar todas as regiões do dataset com múltiplas visões')
     
     args = parser.parse_args()
     
@@ -218,7 +323,10 @@ def main():
         print("   Ajuste o caminho usando --dataset <caminho>")
         return
     
-    visualize_moon_coverage(args.dataset, args.sample)
+    if args.all:
+        visualize_all_coverage(args.dataset)
+    else:
+        visualize_moon_coverage(args.dataset, args.sample)
 
 if __name__ == "__main__":
     main()
