@@ -1,104 +1,120 @@
 import torch
 import torch.nn as nn
+import math
+
+# -------------------------------------------------------------------------
+# Formato do tensor de entrada (B, 6):
+#   [0:3]  xc_n, yc_n, zc_n  ∈ [-1, 1]  — centro na superfície / MOON_RADIUS_KM
+#   [3]    width_n           ∈ [ 0, 1]  — largura / MAX_DIM_KM
+#   [4]    height_n          ∈ [ 0, 1]  — altura  / MAX_DIM_KM
+#   [5]    alt_n             ∈ [ 0, 1]  — altitude / ALT_MAX_KM
+# -------------------------------------------------------------------------
+
 
 class LunarNavigationLoss(nn.Module):
-    def __init__(self, lat_weight=1.0, lon_weight=1.0, alt_weight=1.0):
-        """
-        Função de Perda Híbrida para Navegação Lunar.
-        
-        Args:
-            lat_weight (float): Peso para o erro da Latitude.
-            lon_weight (float): Peso para o erro da Longitude.
-            alt_weight (float): Peso para o erro da Altitude.
-        """
-        super(LunarNavigationLoss, self).__init__()
-        self.lat_weight = lat_weight
-        self.lon_weight = lon_weight
-        self.alt_weight = alt_weight
-        
-        # Usamos L1 (Mean Absolute Error) para Lat e Alt pois é menos 
-        # sensível a outliers do que o MSE no início do treino.
-        self.regression_criterion = nn.L1Loss() 
+    """
+    Função de Perda para Navegação Lunar com saída (B, 6).
 
-    def cyclic_loss(self, pred, target, span=360.0):
+    Componentes:
+      1. Distância superficial normalizada (centro XYZ)
+         Os vetores [xc_n, yc_n, zc_n] são unitários (ponto na superfície
+         dividido por MOON_RADIUS_KM), então a distância angular é:
+
+             theta = arccos( clamp(p . q, -1, 1) )
+
+         Normalizada por pi para ficar em [0, 1]:
+
+             L_center = mean( theta / pi )
+
+      2. Erro L1 normalizado para largura e altura do footprint:
+
+             L_dim = mean( |width_n_pred - width_n_gt|
+                         + |height_n_pred - height_n_gt| ) / 2
+
+      3. Erro L1 normalizado para altitude:
+
+             L_alt = mean( |alt_n_pred - alt_n_gt| )
+
+      Total = w_center * L_center + w_dim * L_dim + w_alt * L_alt
+    """
+
+    def __init__(self, w_center=1.0, w_dim=0.5, w_alt=0.5):
         """
-        Calcula a perda cíclica para a Longitude.
-        Transforma a diferença em um componente angular.
-        
-        Math: Loss = 1 - cos(2 * pi * (pred - target) / span)
-        Isso garante que 0 e 360 tenham erro 0.
+        Args:
+            w_center (float): Peso da distância superficial do centro.
+            w_dim    (float): Peso do erro de largura/altura.
+            w_alt    (float): Peso do erro de altitude.
         """
-        diff = pred - target
-        
-        # Converte a diferença linear para radianos baseados no range (360)
-        # O fator 2*pi normaliza o span para um ciclo completo trigonométrico.
-        rad_diff = (diff / span) * 2 * torch.pi
-        
-        # 1 - cos(x) varia de 0 (sem erro) a 2 (erro máximo em 180 graus de diferença)
-        loss = 1.0 - torch.cos(rad_diff)
-        
-        return torch.mean(loss)
+        super().__init__()
+        self.w_center = w_center
+        self.w_dim    = w_dim
+        self.w_alt    = w_alt
 
     def forward(self, preds, targets):
         """
         Args:
-            preds: Tensor [Batch, 3, H, W] -> Canais: (Lat, Lon, Alt)
-            targets: Tensor [Batch, 3, H, W] -> Canais: (Lat, Lon, Alt)
-            
-        Nota: Este loss assume que os dados entram na escala REAL (graus e km)
-        ou que o 'span' na cyclic_loss seja ajustado se os dados estiverem normalizados.
-        
-        Aqui, assumimos que você fará a desnormalização antes do loss 
-        OU que o modelo já prevê na escala correta. 
-        Se seus dados estiverem normalizados entre [-1, 1], ajuste o 'span' para 2.0.
+            preds   (Tensor): (B, 6) — saída normalizada da rede.
+            targets (Tensor): (B, 6) — ground truth normalizado.
+        Returns:
+            loss (Tensor): escalar diferenciável.
+            components (tuple): (L_center, L_dim, L_alt) para logging.
         """
-        
-        # 1. Separar os canais
-        lat_pred, lon_pred, alt_pred = preds[:, 0], preds[:, 1], preds[:, 2]
-        lat_target, lon_target, alt_target = targets[:, 0], targets[:, 1], targets[:, 2]
+        # ----- 1. Distância superficial normalizada -----
+        p_xyz = preds[:,   :3]   # (B, 3)
+        t_xyz = targets[:, :3]   # (B, 3)
 
-        # 2. Latitude Loss (-60 a 60)
-        # Não é cíclica, usa regressão padrão.
-        loss_lat = self.regression_criterion(lat_pred, lat_target)
+        # Normalizar para vetores unitários antes do produto interno.
+        # O GT já tem norma = 1 por construção (ver dataload), mas a rede pode
+        # prever vetores com norma != 1 — sem normalizar o ponto estaria fora
+        # da superfície lunar, tornando a distância angular incorreta.
+        p_xyz = torch.nn.functional.normalize(p_xyz, p=2, dim=1)
+        t_xyz = torch.nn.functional.normalize(t_xyz, p=2, dim=1)
 
-        # 3. Longitude Loss (0 a 360)
-        # Cíclica: 0 deve ser perto de 360.
-        # Se seus dados estão normalizados [-1, 1], mude span=360 para span=2
-        loss_lon = self.cyclic_loss(lon_pred, lon_target, span=360.0)
+        # Produto interno → cos(theta), clamp por estabilidade numérica
+        dot = (p_xyz * t_xyz).sum(dim=1).clamp(-1.0 + 1e-7, 1.0 - 1e-7)
 
-        # 4. Altitude Loss
-        # Regressão padrão
-        loss_alt = self.regression_criterion(alt_pred, alt_target)
+        # Distância angular em [0, pi], normalizada para [0, 1]
+        theta_norm = torch.acos(dot) / math.pi   # (B,)
+        L_center   = theta_norm.mean()
 
-        # 5. Soma Ponderada
-        total_loss = (loss_lat * self.lat_weight) + \
-                     (loss_lon * self.lon_weight) + \
-                     (loss_alt * self.alt_weight)
+        # ----- 2. Erro de dimensões (footprint) -----
+        L_dim = (
+            (preds[:, 3] - targets[:, 3]).abs() +
+            (preds[:, 4] - targets[:, 4]).abs()
+        ).mean() / 2.0
 
-        return total_loss, (loss_lat, loss_lon, loss_alt)
+        # ----- 3. Erro de altitude -----
+        L_alt = (preds[:, 5] - targets[:, 5]).abs().mean()
 
-# --- Exemplo de Uso ---
+        # ----- Total ponderado -----
+        loss = self.w_center * L_center + self.w_dim * L_dim + self.w_alt * L_alt
+
+        return loss, (L_center, L_dim, L_alt)
+
+
+# --- Bloco de Teste ---
 if __name__ == "__main__":
-    # Simula Batch=2, Canais=3, 512x512
-    # Canal 1 (Lon) simulando o problema da borda: Pred=1 grau, Target=359 graus
-    
-    # Criando dados dummy
-    pred = torch.zeros(2, 3, 512, 512)
-    target = torch.zeros(2, 3, 512, 512)
-    
-    # Caso crítico: Prediz 1°, Alvo é 359° (Erro real deve ser pequeno: 2°)
-    pred[:, 1, :, :] = 1.0   
-    target[:, 1, :, :] = 359.0 
-    
+    torch.manual_seed(0)
+    B = 4
+
+    # Ponto de referência: lat=0, lon=0 na superfície -> xc_n=1, yc_n=0, zc_n=0
+    targets = torch.zeros(B, 6)
+    targets[:, 0] = 1.0   # xc_n = 1  (polo lon=0)
+    targets[:, 3] = 0.5   # width_n
+    targets[:, 4] = 0.4   # height_n
+    targets[:, 5] = 0.3   # alt_n
+
+    # Pred com pequeno desvio
+    preds = targets.clone()
+    preds[:, 0] = 0.9999  # ~0.81° de distância angular
+    preds[:, 1] = 0.01
+    preds[:, 3] += 0.05
+    preds[:, 5] -= 0.02
+
     criterion = LunarNavigationLoss()
-    
-    loss, components = criterion(pred, target)
-    
-    print(f"Loss Total: {loss.item():.6f}")
-    print(f"Componente Lat: {components[0].item():.6f}")
-    print(f"Componente Lon (Cíclico): {components[1].item():.6f}") 
-    print(f"Componente Alt: {components[2].item():.6f}")
-    
-    # O componente Lon deve ser muito baixo (próximo de 0), 
-    # se fosse MSE comum seria enorme ((359-1)^2 = 128164).
-    # Com 1-cos(diff), o erro para 2 graus é minúsculo (~0.0006).
+    loss, (lc, ld, la) = criterion(preds, targets)
+
+    print(f"Loss Total  : {loss.item():.6f}")
+    print(f"  L_center  : {lc.item():.6f}  (dist superficial normalizada, 0=perfeito)")
+    print(f"  L_dim     : {ld.item():.6f}  (erro largura/altura normalizado)")
+    print(f"  L_alt     : {la.item():.6f}  (erro altitude normalizado)")

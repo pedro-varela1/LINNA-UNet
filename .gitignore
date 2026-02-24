@@ -4,3 +4,4 @@ __pycache__/
 *.pt
 *.pth
 linna/
+train_visualizations_old/

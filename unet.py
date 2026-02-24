@@ -73,10 +73,13 @@ class OutConv(nn.Module):
         return self.conv(x)
 
 class LunarUNet(nn.Module):
-    def __init__(self, n_channels=1, n_classes=12, bilinear=True):
+    def __init__(self, n_channels=1, n_classes=6, bilinear=True):
         super(LunarUNet, self).__init__()
         self.n_channels = n_channels
-        self.n_classes = n_classes  # Agora são 12: 4 pontos × 3 coordenadas
+        # Saída: 6 valores por frame
+        #   [xc, yc, zc]          => coordenadas do centro na superfície (tanh -> [-1,1])
+        #   [width, height, alt]  => dimensões e altitude (sigmoid -> [0,1])
+        self.n_classes = n_classes
         self.bilinear = bilinear
 
         # --- 1. Encoder: ResNet50 Pré-treinada ---
@@ -130,7 +133,8 @@ class LunarUNet(nn.Module):
         self.up5_upsample = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
         self.up5_conv = DoubleConv(64, 32) # Reduz para 32 canais antes da saída
 
-        # Global Average Pooling + FC para produzir 12 valores (4 pontos × 3 coordenadas)
+        # Global Average Pooling + FC para produzir n_classes valores
+        # Saída esperada: [xc, yc, zc, width, height, alt]
         self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
         self.fc = nn.Linear(32, n_classes)
 
@@ -163,13 +167,16 @@ class LunarUNet(nn.Module):
         # Flatten: (B, 32, 1, 1) -> (B, 32)
         x = x.view(x.size(0), -1)
         
-        # FC: (B, 32) -> (B, 12)
+        # FC: (B, 32) -> (B, n_classes)
         x = self.fc(x)
-        
-        # Ativação Tanh para garantir output em [-1, 1]
-        # Isso corresponde ao range das coordenadas cartesianas normalizadas
-        output = torch.tanh(x)
-        
+
+        # Ativações diferenciadas por grupo de saída:
+        #   [:3]  - XYZ do centro da imagem na superfície: tanh  -> [-1, 1]
+        #   [3:]  - largura, altura (km) e altitude (km): sigmoid -> [ 0, 1]
+        xyz_out  = torch.tanh(x[:, :3])
+        dim_out  = torch.sigmoid(x[:, 3:])
+        output   = torch.cat([xyz_out, dim_out], dim=1)  # (B, n_classes)
+
         return output
 
 # --- Bloco de Teste Rápido ---
@@ -181,17 +188,17 @@ if __name__ == "__main__":
     dummy_input = torch.randn(2, 1, 512, 512)
     
     # 2. Instanciar modelo
-    model = LunarUNet(n_channels=1, n_classes=12)
-    
+    model = LunarUNet(n_channels=1, n_classes=6)
+
     # 3. Forward Pass
     try:
         output = model(dummy_input)
         print(f"✅ Sucesso!")
         print(f"   Input shape:  {dummy_input.shape}")
-        print(f"   Output shape: {output.shape}") 
-        
-        # Verificação extra
-        assert output.shape == (2, 12), "Erro: Dimensão de saída incorreta!"
-        print(f"   Output range: [{output.min().item():.3f}, {output.max().item():.3f}]")
+        print(f"   Output shape: {output.shape}")
+
+        assert output.shape == (2, 6), "Erro: Dimensão de saída incorreta!"
+        print(f"   XYZ range (tanh) :  [{output[:, :3].min().item():.3f}, {output[:, :3].max().item():.3f}]")
+        print(f"   W/H/Alt range (sigmoid): [{output[:, 3:].min().item():.3f}, {output[:, 3:].max().item():.3f}]")
     except Exception as e:
         print(f"❌ Erro durante o forward pass: {e}")

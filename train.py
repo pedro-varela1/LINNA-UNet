@@ -2,6 +2,7 @@ import torch
 import torch.optim as optim
 import csv
 import os
+import math
 import time
 from tqdm import tqdm
 import matplotlib.pyplot as plt
@@ -11,7 +12,8 @@ import numpy as np
 # Importando seus módulos customizados
 # Certifique-se de que os arquivos estão na mesma pasta
 from unet import LunarUNet
-from dataload import get_dataloaders, LunarDataset, MOON_RADIUS_KM, cartesian_to_latlon
+from dataload import get_dataloaders, LunarDataset, MOON_RADIUS_KM, cartesian_to_latlon, ALT_MAX_KM
+from loss import LunarNavigationLoss
 from test import compute_metrics
 
 # --- CONFIGURAÇÕES E HIPERPARÂMETROS ---
@@ -20,7 +22,10 @@ CONFIG = {
     "num_epochs": 50,
     "batch_size": 4,           # Ajuste conforme a VRAM da sua GPU
     "learning_rate": 1e-4,     # Learning rate padrão para U-Net/Adam
-    "val_split": 0.1,
+    "val_split": 0.1,          # mantido para referência (não usado — ver group_size/val_per_group)
+    "group_size": 12,          # imagens por grupo/região
+    "val_per_group": 2,        # imagens de validação por grupo (sorteadas aleatoriamente)
+    "random_seed": 42,         # semente para reprodutibilidade do sorteio
     "save_dir": "./checkpoints",
     "csv_log_file": "training_metrics.csv",
     "device": "cuda" if torch.cuda.is_available() else "cpu",
@@ -28,6 +33,98 @@ CONFIG = {
     "metric_threshold_km": 1.0,
     "viz_dir": "./train_visualizations",
 }
+
+def _parse_replay(replay):
+    """
+    Extrai os nomes das augmentations que foram efetivamente aplicadas
+    a partir do dict de replay do ReplayCompose.
+    """
+    applied = []
+    if replay is None:
+        return applied
+    for t in replay.get('transforms', []):
+        if t.get('applied', False):
+            name = t.get('__class_fullname__', '')
+            # Pega só o nome curto (sem módulo)
+            short = name.split('.')[-1] if '.' in name else name
+            applied.append(short)
+    return applied
+
+
+def visualize_dataset_samples(train_ds, val_ds, save_dir):
+    """
+    Gera uma figura com 3 exemplos antes do treino:
+      - Coluna 0: sem augmentation (val_ds)
+      - Coluna 1 e 2: com augmentation (train_ds)
+    Labels em escala real:
+      lat/lon do centro, altitude, largura e altura em km.
+    """
+    os.makedirs(save_dir, exist_ok=True)
+
+    # Coleta as amostras
+    samples = []  # lista de (image_np, target_tensor, aug_names)
+
+    # 1 sem augmentation (do val_ds, que tem augmentations=None)
+    img_t, tgt_t = val_ds[0]
+    samples.append((img_t[0].numpy(), tgt_t, []))
+
+    # 2 com augmentation (do train_ds)
+    for i in range(2):
+        img_t, tgt_t = train_ds[i]
+        replay = train_ds._last_aug_replay
+        aug_names = _parse_replay(replay)
+        samples.append((img_t[0].numpy(), tgt_t, aug_names))
+
+    fig, axes = plt.subplots(1, 3, figsize=(18, 7))
+    titles = ['Sem Augmentation (val)', 'Com Augmentation #1 (treino)', 'Com Augmentation #2 (treino)']
+
+    for ax, (img_np, tgt, aug_names), title in zip(axes, samples, titles):
+        ax.imshow(img_np, cmap='gray', vmin=0, vmax=1)
+        ax.set_title(title, fontsize=11, fontweight='bold', pad=10)
+        ax.axis('off')
+
+        # Desnormalizar labels para escala real
+        tgt_phys = val_ds.denormalize(tgt.unsqueeze(0))[0]  # (6,)
+        xc_km, yc_km, zc_km = tgt_phys[:3].tolist()
+        width_km  = tgt_phys[3].item()
+        height_km = tgt_phys[4].item()
+        alt_km    = tgt_phys[5].item()
+
+        # Converter XYZ -> lat/lon
+        r    = math.sqrt(xc_km**2 + yc_km**2 + zc_km**2)
+        lat  = math.degrees(math.asin(max(-1.0, min(1.0, zc_km / r))))
+        lon  = math.degrees(math.atan2(yc_km, xc_km))
+        lon  = lon + 360.0 if lon < 0 else lon
+
+        label_lines = [
+            f"Lat:  {lat:+.3f}°",
+            f"Lon:  {lon:.3f}°",
+            f"Alt:  {alt_km:.1f} km",
+            f"W:    {width_km:.1f} km",
+            f"H:    {height_km:.1f} km",
+        ]
+        if aug_names:
+            label_lines += ['', 'Augmentations:'] + [f"  • {a}" for a in aug_names]
+        else:
+            label_lines += ['', '(sem augmentation)']
+
+        label_text = '\n'.join(label_lines)
+        ax.text(
+            0.02, 0.02, label_text,
+            transform=ax.transAxes,
+            fontsize=8, verticalalignment='bottom',
+            bbox=dict(boxstyle='round,pad=0.4', facecolor='black', alpha=0.65),
+            color='white', family='monospace'
+        )
+
+    plt.suptitle('Exemplos do Dataset antes do Treino', fontsize=14, fontweight='bold', y=1.01)
+    plt.tight_layout()
+
+    save_path = os.path.join(save_dir, 'dataset_samples_preview.png')
+    plt.savefig(save_path, dpi=120, bbox_inches='tight')
+    plt.close()
+    print(f"   🖼️  Preview do dataset salvo em: {save_path}")
+
 
 def create_sphere(radius, resolution=30):
     """Cria uma malha esférica para visualização."""
@@ -43,77 +140,69 @@ def create_sphere(radius, resolution=30):
 def visualize_predictions(model, val_loader, epoch, device, save_dir, num_samples=3):
     """
     Visualiza predições do modelo em uma esfera lunar.
-    Ground truth em verde, predições em vermelho.
+    Mostra o ponto central previsto vs. ground truth, com a indicação
+    das dimensões do footprint.
     """
     model.eval()
     os.makedirs(save_dir, exist_ok=True)
-    
-    # Pegar alguns exemplos
+
+    MAX_DIM_KM = val_loader.dataset.MAX_DIM_KM
+    ALT_NORM   = val_loader.dataset.ALT_NORM
+
     samples_collected = 0
-    
+
     with torch.no_grad():
         for batch_idx, (images, targets) in enumerate(val_loader):
             if samples_collected >= num_samples:
                 break
-            
+
             images = images.to(device)
-            preds = model(images)
-            
-            # Processar cada imagem no batch
+            preds  = model(images)
+
             for i in range(min(images.shape[0], num_samples - samples_collected)):
-                # Desnormalizar
-                pred_denorm = LunarDataset.denormalize(preds[i:i+1])  # (1, 12)
-                targ_denorm = LunarDataset.denormalize(targets[i:i+1])  # (1, 12)
-                
-                # Reshape para (4, 3)
-                pred_coords = pred_denorm.view(4, 3).cpu().numpy()
-                targ_coords = targ_denorm.view(4, 3).cpu().numpy()
-                
-                # Criar figura
+                # Desnormalizar usando o método de instância do dataset
+                ds = val_loader.dataset
+                pred_phys = ds.denormalize(preds[i:i+1].cpu())    # (1, 6)
+                targ_phys = ds.denormalize(targets[i:i+1].cpu())  # (1, 6)
+
+                # Extrair componentes [xc, yc, zc, width, height, alt]
+                p_xyz  = pred_phys[0, :3].numpy()
+                p_wha  = pred_phys[0, 3:].numpy()   # [width, height, alt]
+                t_xyz  = targ_phys[0, :3].numpy()
+                t_wha  = targ_phys[0, 3:].numpy()
+
                 fig = plt.figure(figsize=(14, 6))
-                
+
                 # Subplot 1: Imagem original
                 ax1 = fig.add_subplot(1, 2, 1)
-                img_np = images[i, 0].cpu().numpy()
-                ax1.imshow(img_np, cmap='gray')
-                ax1.set_title(f'Input Image - Epoch {epoch}', fontsize=12, fontweight='bold')
+                ax1.imshow(images[i, 0].cpu().numpy(), cmap='gray')
+                ax1.set_title(f'Input Image — Epoch {epoch}', fontsize=12, fontweight='bold')
                 ax1.axis('off')
-                
-                # Subplot 2: Esfera 3D
+
+                # Anotações na imagem
+                ax1.set_xlabel(
+                    f"GT   — centro:({t_xyz[0]:.0f}, {t_xyz[1]:.0f}, {t_xyz[2]:.0f}) km  "
+                    f"| {t_wha[0]:.1f}×{t_wha[1]:.1f} km  | alt {t_wha[2]:.1f} km\n"
+                    f"Pred — centro:({p_xyz[0]:.0f}, {p_xyz[1]:.0f}, {p_xyz[2]:.0f}) km  "
+                    f"| {p_wha[0]:.1f}×{p_wha[1]:.1f} km  | alt {p_wha[2]:.1f} km",
+                    fontsize=7
+                )
+
+                # Subplot 2: Esfera 3D — apenas o ponto central
                 ax2 = fig.add_subplot(1, 2, 2, projection='3d')
-                
-                # Desenhar esfera base
+
                 sphere_radius = MOON_RADIUS_KM
-                x_sphere, y_sphere, z_sphere = create_sphere(sphere_radius, resolution=40)
-                ax2.plot_surface(x_sphere, y_sphere, z_sphere, color='lightgray', 
-                               alpha=0.2, edgecolor='none')
-                
-                # Plotar pontos do ground truth (verde)
-                for j in range(4):
-                    x_gt, y_gt, z_gt = targ_coords[j]
-                    ax2.scatter(x_gt, y_gt, z_gt, c='green', s=100, marker='o', 
-                              label='Ground Truth' if j == 0 else '', edgecolors='darkgreen', linewidth=2)
-                
-                # Plotar pontos preditos (vermelho)
-                for j in range(4):
-                    x_pr, y_pr, z_pr = pred_coords[j]
-                    ax2.scatter(x_pr, y_pr, z_pr, c='red', s=100, marker='^', 
-                              label='Prediction' if j == 0 else '', edgecolors='darkred', linewidth=2)
-                
-                # Conectar os 4 pontos para formar um quadrilátero (GT)
-                corner_order = [0, 1, 3, 2, 0]  # TL, TR, BR, BL, TL
-                gt_x = [targ_coords[idx, 0] for idx in corner_order]
-                gt_y = [targ_coords[idx, 1] for idx in corner_order]
-                gt_z = [targ_coords[idx, 2] for idx in corner_order]
-                ax2.plot(gt_x, gt_y, gt_z, 'g-', linewidth=2, alpha=0.6)
-                
-                # Conectar os 4 pontos preditos
-                pr_x = [pred_coords[idx, 0] for idx in corner_order]
-                pr_y = [pred_coords[idx, 1] for idx in corner_order]
-                pr_z = [pred_coords[idx, 2] for idx in corner_order]
-                ax2.plot(pr_x, pr_y, pr_z, 'r--', linewidth=2, alpha=0.6)
-                
-                # Configurar visualização
+                x_s, y_s, z_s = create_sphere(sphere_radius, resolution=40)
+                ax2.plot_surface(x_s, y_s, z_s, color='lightgray', alpha=0.2, edgecolor='none')
+
+                # Ground truth — centro (verde)
+                ax2.scatter(*t_xyz, c='green', s=150, marker='o',
+                            label='GT Center', edgecolors='darkgreen', linewidth=2)
+
+                # Predição — centro (vermelho)
+                ax2.scatter(*p_xyz, c='red', s=150, marker='^',
+                            label='Pred Center', edgecolors='darkred', linewidth=2)
+
                 max_range = sphere_radius * 1.3
                 ax2.set_xlim([-max_range, max_range])
                 ax2.set_ylim([-max_range, max_range])
@@ -121,98 +210,99 @@ def visualize_predictions(model, val_loader, epoch, device, save_dir, num_sample
                 ax2.set_xlabel('X (km)', fontweight='bold')
                 ax2.set_ylabel('Y (km)', fontweight='bold')
                 ax2.set_zlabel('Z (km)', fontweight='bold')
-                ax2.set_title(f'4 Corner Points - Epoch {epoch}', fontsize=12, fontweight='bold')
+                ax2.set_title(f'Center Point — Epoch {epoch}', fontsize=12, fontweight='bold')
                 ax2.legend(loc='upper right')
                 ax2.set_box_aspect([1, 1, 1])
                 ax2.view_init(elev=20, azim=45)
-                
+
                 plt.tight_layout()
-                
-                # Salvar
+
                 save_path = os.path.join(save_dir, f'epoch_{epoch:03d}_sample_{samples_collected + 1}.png')
                 plt.savefig(save_path, dpi=100, bbox_inches='tight')
                 plt.close()
-                
+
                 samples_collected += 1
                 if samples_collected >= num_samples:
                     break
-    
+
     print(f"   📊 Visualizações salvas em: {save_dir}")
 
 def train_one_epoch(model, loader, criterion, optimizer, device):
     model.train()
     running_loss = 0.0
-    
-    # Acumuladores de métricas físicas
+
     total_pos_error = 0.0
     total_alt_error = 0.0
-    total_accuracy = 0.0
-    
+    total_accuracy  = 0.0
+
+    max_dim_km = loader.dataset.MAX_DIM_KM
+
     pbar = tqdm(loader, desc="Training", unit="batch")
-    
+
     for images, targets in pbar:
-        images = images.to(device)
+        images  = images.to(device)
         targets = targets.to(device)
-        
-        # 1. Forward
+
         optimizer.zero_grad()
         preds = model(images)
-        
-        # 2. Cálculo da Loss (MSE direto nos valores normalizados)
-        loss = criterion(preds, targets)
-        
-        # 3. Backward
+
+        loss, _ = criterion(preds, targets)
         loss.backward()
         optimizer.step()
-        
+
         running_loss += loss.item()
-        
-        # 4. Métricas
+
         with torch.no_grad():
-            batch_metrics = compute_metrics(preds, targets, threshold_km=CONFIG["metric_threshold_km"])
+            batch_metrics = compute_metrics(
+                preds, targets,
+                max_dim_km=max_dim_km,
+                threshold_km=CONFIG["metric_threshold_km"]
+            )
             total_pos_error += batch_metrics["mean_position_error_km"]
             total_alt_error += batch_metrics["mean_altitude_error_km"]
             total_accuracy  += batch_metrics["accuracy_percent"]
-            
+
         pbar.set_postfix(loss=loss.item())
 
-    # Médias da época
-    avg_loss = running_loss / len(loader)
+    avg_loss    = running_loss    / len(loader)
     avg_pos_err = total_pos_error / len(loader)
     avg_alt_err = total_alt_error / len(loader)
-    avg_acc = total_accuracy / len(loader)
-    
+    avg_acc     = total_accuracy  / len(loader)
+
     return avg_loss, avg_pos_err, avg_alt_err, avg_acc
 
 def validate(model, loader, criterion, device):
     model.eval()
-    running_loss = 0.0
+    running_loss    = 0.0
     total_pos_error = 0.0
     total_alt_error = 0.0
-    total_accuracy = 0.0
-    
+    total_accuracy  = 0.0
+
+    max_dim_km = loader.dataset.MAX_DIM_KM
+
     with torch.no_grad():
         for images, targets in tqdm(loader, desc="Validation", unit="batch"):
-            images = images.to(device)
+            images  = images.to(device)
             targets = targets.to(device)
-            
+
             preds = model(images)
-            
-            # Cálculo da Loss (MSE)
-            loss = criterion(preds, targets)
+            loss, _  = criterion(preds, targets)
             running_loss += loss.item()
-            
-            # Métricas Físicas
-            batch_metrics = compute_metrics(preds, targets, threshold_km=CONFIG["metric_threshold_km"])
+
+            batch_metrics = compute_metrics(
+                preds, targets,
+                max_dim_km=max_dim_km,
+                threshold_km=CONFIG["metric_threshold_km"]
+            )
             total_pos_error += batch_metrics["mean_position_error_km"]
             total_alt_error += batch_metrics["mean_altitude_error_km"]
             total_accuracy  += batch_metrics["accuracy_percent"]
 
-    avg_loss = running_loss / len(loader)
+    avg_loss    = running_loss    / len(loader)
     avg_pos_err = total_pos_error / len(loader)
     avg_alt_err = total_alt_error / len(loader)
-    avg_acc = total_accuracy / len(loader)
-    
+    avg_acc     = total_accuracy  / len(loader)
+
     return avg_loss, avg_pos_err, avg_alt_err, avg_acc
 
 def main():
@@ -232,17 +322,32 @@ def main():
     
     # 2. Carregar Dados
     train_loader, val_loader = get_dataloaders(
-        CONFIG["dataset_root"], 
-        batch_size=CONFIG["batch_size"], 
-        val_split=CONFIG["val_split"],
+        CONFIG["dataset_root"],
+        batch_size=CONFIG["batch_size"],
+        group_size=CONFIG["group_size"],
+        val_per_group=CONFIG["val_per_group"],
+        random_seed=CONFIG["random_seed"],
         num_workers=CONFIG["num_workers"]
     )
 
+    # 2.5 Preview do dataset antes do treino
+    print("\n🖼️  Gerando preview do dataset...")
+    visualize_dataset_samples(
+        train_ds=train_loader.dataset,
+        val_ds=val_loader.dataset,
+        save_dir=CONFIG["viz_dir"]
+    )
+
     # 3. Inicializar Modelo e Otimização
-    model = LunarUNet(n_channels=1, n_classes=12).to(CONFIG["device"])
+    model = LunarUNet(n_channels=1, n_classes=6).to(CONFIG["device"])
     
-    # Função de Perda - MSE já que os valores estão normalizados em [-1, 1]
-    criterion = torch.nn.MSELoss()
+    # Função de Perda — distância superficial normalizada para o centro XYZ
+    # + L1 normalizado para dimensões e altitude
+    criterion = LunarNavigationLoss(
+        w_center=1.0,   # peso da distância superficial (principal)
+        w_dim=0.5,      # peso do erro de largura/altura
+        w_alt=0.5,      # peso do erro de altitude
+    )
     
     optimizer = optim.Adam(model.parameters(), lr=CONFIG["learning_rate"])
     
