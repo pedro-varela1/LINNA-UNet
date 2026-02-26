@@ -82,102 +82,81 @@ class LunarUNet(nn.Module):
         self.n_classes = n_classes
         self.bilinear = bilinear
 
-        # --- 1. Encoder: ResNet50 Pré-treinada ---
-        # Usamos weights='DEFAULT' para pegar os melhores pesos disponíveis
+        # --- 1. Encoder: ResNet18 Pré-treinada (mais leve que ResNet50) ---
         try:
-            weights = models.ResNet50_Weights.DEFAULT
-            self.resnet = models.resnet50(weights=weights)
+            weights = models.ResNet18_Weights.DEFAULT
+            self.resnet = models.resnet18(weights=weights)
         except:
-            # Fallback para versões mais antigas do torch
-            self.resnet = models.resnet50(pretrained=True)
+            self.resnet = models.resnet18(pretrained=True)
 
         # Adaptação para Grayscale (1 canal) mantendo os pesos
-        # A conv1 original é (64, 3, 7, 7). Vamos somar os pesos dos 3 canais para virar (64, 1, 7, 7)
         original_conv1 = self.resnet.conv1
         self.resnet.conv1 = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
-        
         with torch.no_grad():
-            # Soma os pesos RGB para criar um filtro de intensidade robusto
             self.resnet.conv1.weight.data = original_conv1.weight.data.sum(dim=1, keepdim=True)
-        
-        # Camadas do Encoder (Extraídas da ResNet)
-        self.enc0 = nn.Sequential(self.resnet.conv1, self.resnet.bn1, self.resnet.relu) # Stem
-        self.enc1 = self.resnet.maxpool # Pool
-        self.enc2 = self.resnet.layer1  # 256 canais
-        self.enc3 = self.resnet.layer2  # 512 canais
-        self.enc4 = self.resnet.layer3  # 1024 canais
-        self.enc5 = self.resnet.layer4  # 2048 canais (Bottleneck)
+
+        # Camadas do Encoder (ResNet18)
+        # Stem    -> 64 ch  (enc0)
+        # layer1  -> 64 ch  (enc2)   ← BasicBlock, sem expansão
+        # layer2  -> 128 ch (enc3)
+        # layer3  -> 256 ch (enc4)
+        # layer4  -> 512 ch (enc5)   ← Bottleneck
+        self.enc0 = nn.Sequential(self.resnet.conv1, self.resnet.bn1, self.resnet.relu)
+        self.enc1 = self.resnet.maxpool
+        self.enc2 = self.resnet.layer1   # 64 ch
+        self.enc3 = self.resnet.layer2   # 128 ch
+        self.enc4 = self.resnet.layer3   # 256 ch
+        self.enc5 = self.resnet.layer4   # 512 ch
 
         # --- 2. Decoder ---
-        # Canais da ResNet50:
-        # Layer 4 (Bottleneck): 2048
-        # Layer 3 (Skip 4): 1024
-        # Layer 2 (Skip 3): 512
-        # Layer 1 (Skip 2): 256
-        # Stem    (Skip 1): 64  (Saída do enc0)
-        
-        # Up1: Input 2048 + Skip 1024 -> Out 1024
-        self.up1 = ResNetUp(in_channels=2048, skip_channels=1024, out_channels=1024, bilinear=bilinear)
-        
-        # Up2: Input 1024 + Skip 512 -> Out 512
-        self.up2 = ResNetUp(in_channels=1024, skip_channels=512,  out_channels=512,  bilinear=bilinear)
-        
-        # Up3: Input 512  + Skip 256 -> Out 256
-        self.up3 = ResNetUp(in_channels=512,  skip_channels=256,  out_channels=256,  bilinear=bilinear)
-        
-        # Up4: Input 256  + Skip 64  -> Out 64
-        self.up4 = ResNetUp(in_channels=256,  skip_channels=64,   out_channels=64,   bilinear=bilinear)
-        
-        # Up5: Input 64 (Sem skip, apenas upsample final para restaurar resolução total)
-        # ResNet reduz a imagem em 2x logo no início. Precisamos de um bloco final.
-        self.up5_upsample = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-        self.up5_conv = DoubleConv(64, 32) # Reduz para 32 canais antes da saída
+        # Up1: 512 + skip 256  -> 256
+        self.up1 = ResNetUp(in_channels=512,  skip_channels=256, out_channels=256, bilinear=bilinear)
+        # Up2: 256 + skip 128  -> 128
+        self.up2 = ResNetUp(in_channels=256,  skip_channels=128, out_channels=128, bilinear=bilinear)
+        # Up3: 128 + skip 64   -> 64
+        self.up3 = ResNetUp(in_channels=128,  skip_channels=64,  out_channels=64,  bilinear=bilinear)
+        # Up4: 64  + skip 64   -> 32  (skip = Stem)
+        self.up4 = ResNetUp(in_channels=64,   skip_channels=64,  out_channels=32,  bilinear=bilinear)
 
-        # Global Average Pooling + FC para produzir n_classes valores
-        # Saída esperada: [xc, yc, zc, width, height, alt]
+        # Upsample final (restaura resolução 2× cortada pelo stem)
+        self.up5_upsample = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+        self.up5_conv = DoubleConv(32, 16)
+
+        # Global Average Pooling + FC
         self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
-        self.fc = nn.Linear(32, n_classes)
+        self.fc = nn.Linear(16, n_classes)
 
     def forward(self, x):
         # --- Encoder Path ---
-        # x: (B, 1, 512, 512)
-        
-        x0 = self.enc0(x)      # Stem: (B, 64, 256, 256) -> SKIP 1
-        x1 = self.enc1(x0)     # Maxpool: (B, 64, 128, 128)
-        
-        x2 = self.enc2(x1)     # Layer1: (B, 256, 128, 128) -> SKIP 2
-        x3 = self.enc3(x2)     # Layer2: (B, 512, 64, 64)   -> SKIP 3
-        x4 = self.enc4(x3)     # Layer3: (B, 1024, 32, 32)  -> SKIP 4
-        x5 = self.enc5(x4)     # Layer4: (B, 2048, 16, 16)  -> Bottleneck
+        # x: (B, 1, H, W)
+        x0 = self.enc0(x)      # Stem:   (B, 64, H/2,  W/2)  -> SKIP 1
+        x1 = self.enc1(x0)     # Pool:   (B, 64, H/4,  W/4)
+        x2 = self.enc2(x1)     # layer1: (B, 64, H/4,  W/4)  -> SKIP 2
+        x3 = self.enc3(x2)     # layer2: (B,128, H/8,  W/8)  -> SKIP 3
+        x4 = self.enc4(x3)     # layer3: (B,256, H/16, W/16) -> SKIP 4
+        x5 = self.enc5(x4)     # layer4: (B,512, H/32, W/32) -> Bottleneck
 
         # --- Decoder Path ---
-        x = self.up1(x5, x4)   # 16->32. Cat x4. Out: 1024
-        x = self.up2(x, x3)    # 32->64. Cat x3. Out: 512
-        x = self.up3(x, x2)    # 64->128. Cat x2. Out: 256
-        
-        # Atenção: x0 é o skip da Stem (antes do maxpool)
-        x = self.up4(x, x0)    # 128->256. Cat x0. Out: 64
+        x = self.up1(x5, x4)   # 512+256  -> 256
+        x = self.up2(x,  x3)   # 256+128  -> 128
+        x = self.up3(x,  x2)   # 128+64   -> 64
+        x = self.up4(x,  x0)   # 64+64    -> 32  (skip = Stem)
 
-        # Upsample Final (256->512)
+        # Upsample final
         x = self.up5_upsample(x)
-        x = self.up5_conv(x)
-        
-        # Global Average Pooling: (B, 32, 512, 512) -> (B, 32, 1, 1)
+        x = self.up5_conv(x)   # -> 16 ch
+
+        # Global Average Pooling + FC
         x = self.global_pool(x)
-        # Flatten: (B, 32, 1, 1) -> (B, 32)
-        x = x.view(x.size(0), -1)
-        
-        # FC: (B, 32) -> (B, n_classes)
-        x = self.fc(x)
+        x = x.view(x.size(0), -1)   # (B, 16)
+        x = self.fc(x)               # (B, n_classes)
 
         # Ativações diferenciadas por grupo de saída:
         #   [:3]  - XYZ do centro da imagem na superfície: tanh  -> [-1, 1]
         #   [3:]  - largura, altura (km) e altitude (km): sigmoid -> [ 0, 1]
-        xyz_out  = torch.tanh(x[:, :3])
-        dim_out  = torch.sigmoid(x[:, 3:])
-        output   = torch.cat([xyz_out, dim_out], dim=1)  # (B, n_classes)
-
-        return output
+        xyz_out = torch.tanh(x[:, :3])
+        dim_out = torch.sigmoid(x[:, 3:])
+        return torch.cat([xyz_out, dim_out], dim=1)
 
 # --- Bloco de Teste Rápido ---
 if __name__ == "__main__":

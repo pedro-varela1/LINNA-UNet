@@ -19,8 +19,8 @@ from test import compute_metrics
 # --- CONFIGURAÇÕES E HIPERPARÂMETROS ---
 CONFIG = {
     "dataset_root": "../LINNA-Crater/LunarLanding_Dataset/LunarLanding_Dataset",
-    "num_epochs": 8,
-    "batch_size": 4,           # Ajuste conforme a VRAM da sua GPU
+    "num_epochs": 50,
+    "batch_size": 8,           # Ajuste conforme a VRAM da sua GPU
     "learning_rate": 1e-4,     # Learning rate padrão para U-Net/Adam
     "val_split": 0.1,          # mantido para referência (não usado — ver group_size/val_per_group)
     "group_size": 12,          # imagens por grupo/região
