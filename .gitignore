@@ -1,6 +1,7 @@
 dataset/
 checkpoints/
 __pycache__/
+train_altitude/__pycache__/
 *.pt
 *.pth
 linna/
