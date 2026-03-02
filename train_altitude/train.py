@@ -1,5 +1,5 @@
 """
-Training script for altitude-only prediction using ResNet18.
+Training script for altitude-only prediction using MobileNetV2.
 
 Usage:
     python train.py
@@ -15,16 +15,16 @@ import torch.optim as optim
 from tqdm import tqdm
 
 from dataload import get_dataloaders
-from model import AltitudeResNet
+from model import AltitudeMobileNet
 from test import compute_metrics
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 CONFIG = {
-    "dataset_root":  "/media/ita/DATA/LINNA-Crater/LunarLanding_Dataset/",
-    "num_epochs":    50,
-    "batch_size":    8,
+    "dataset_root":  "../../LINNA-Crater/LunarLanding_Dataset/LunarLanding_Dataset",
+    "num_epochs":    100,
+    "batch_size":    32,
     "learning_rate": 1e-4,
     "img_size":      224,
     "group_size":    12,
@@ -39,7 +39,7 @@ CONFIG = {
 # ---------------------------------------------------------------------------
 
 
-def train_one_epoch(model, loader, criterion, optimizer, device, threshold_km):
+def train_one_epoch(model, loader, criterion, optimizer, device, threshold_km, alt_mean, alt_std):
     model.train()
     total_loss, total_mae, total_acc = 0.0, 0.0, 0.0
 
@@ -55,7 +55,7 @@ def train_one_epoch(model, loader, criterion, optimizer, device, threshold_km):
         total_loss += loss.item()
 
         with torch.no_grad():
-            m = compute_metrics(preds, targets, threshold_km=threshold_km)
+            m = compute_metrics(preds, targets, alt_mean=alt_mean, alt_std=alt_std, threshold_km=threshold_km)
             total_mae += m["mae_km"]
             total_acc += m["accuracy_percent"]
 
@@ -63,7 +63,7 @@ def train_one_epoch(model, loader, criterion, optimizer, device, threshold_km):
     return total_loss / n, total_mae / n, total_acc / n
 
 
-def validate(model, loader, criterion, device, threshold_km):
+def validate(model, loader, criterion, device, threshold_km, alt_mean, alt_std):
     model.eval()
     total_loss, total_mae, total_acc = 0.0, 0.0, 0.0
 
@@ -75,7 +75,7 @@ def validate(model, loader, criterion, device, threshold_km):
             loss  = criterion(preds, targets)
 
             total_loss += loss.item()
-            m = compute_metrics(preds, targets, threshold_km=threshold_km)
+            m = compute_metrics(preds, targets, alt_mean=alt_mean, alt_std=alt_std, threshold_km=threshold_km)
             total_mae += m["mae_km"]
             total_acc += m["accuracy_percent"]
 
@@ -98,7 +98,7 @@ def main():
     print(f"🚀  Device: {CONFIG['device']}")
 
     # Data
-    train_loader, val_loader = get_dataloaders(
+    train_loader, val_loader, alt_mean, alt_std = get_dataloaders(
         CONFIG["dataset_root"],
         batch_size    = CONFIG["batch_size"],
         img_size      = CONFIG["img_size"],
@@ -109,8 +109,11 @@ def main():
     )
 
     # Model, loss, optimizer
-    model     = AltitudeResNet().to(CONFIG["device"])
-    criterion = nn.L1Loss()
+    model     = AltitudeMobileNet().to(CONFIG["device"])
+    # Huber loss: behaves like L2 for small errors (fast convergence) and
+    # like L1 for large errors (robust to outliers). delta=1.0 ≈ 1 std deviation
+    # in z-score space, so it switches regime at roughly 1 std away.
+    criterion = nn.HuberLoss(delta=1.0)
     optimizer = optim.Adam(model.parameters(), lr=CONFIG["learning_rate"])
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", factor=0.5, patience=5
@@ -124,11 +127,11 @@ def main():
 
         tr_loss, tr_mae, tr_acc = train_one_epoch(
             model, train_loader, criterion, optimizer,
-            CONFIG["device"], CONFIG["threshold_km"]
+            CONFIG["device"], CONFIG["threshold_km"], alt_mean, alt_std
         )
         val_loss, val_mae, val_acc = validate(
             model, val_loader, criterion,
-            CONFIG["device"], CONFIG["threshold_km"]
+            CONFIG["device"], CONFIG["threshold_km"], alt_mean, alt_std
         )
 
         elapsed = time.time() - t0

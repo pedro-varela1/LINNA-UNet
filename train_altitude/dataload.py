@@ -18,14 +18,17 @@ import albumentations as A
 ALT_MIN_KM = 0.0
 ALT_MAX_KM = 120.0  # Maximum expected satellite altitude above the surface (km)
 
+# CLAHE parameters (applied to every image before augmentation)
+_CLAHE = cv2.createCLAHE(clipLimit=8.0, tileGridSize=(8, 8))
+
 
 class AltitudeDataset(Dataset):
     """
     Dataset that pairs a grayscale lunar image with the satellite altitude (km).
 
     Each sample returns:
-        image   (Tensor): shape (1, img_size, img_size), values in [0, 1].
-        altitude (Tensor): scalar, normalized altitude in [0, 1].
+        image    (Tensor): shape (1, img_size, img_size), CLAHE-enhanced, values in [0, 1].
+        altitude (Tensor): scalar, z-score normalized altitude ((alt_km - mean) / std).
     """
 
     def __init__(
@@ -36,6 +39,8 @@ class AltitudeDataset(Dataset):
         val_per_group: int = 2,
         random_seed: int = 42,
         img_size: int = 224,
+        alt_mean: float = None,
+        alt_std:  float = None,
     ):
         """
         Args:
@@ -44,7 +49,9 @@ class AltitudeDataset(Dataset):
             group_size   : Number of images per geographic region group.
             val_per_group: Images randomly assigned to validation per group.
             random_seed  : Seed for the train/val split.
-            img_size     : Resize target for ResNet18 (default 224).
+            img_size     : Resize target for MobileNetV2 (default 224).
+            alt_mean     : Pre-computed mean altitude (km) for z-score. If None, computed from this split.
+            alt_std      : Pre-computed std  altitude (km) for z-score. If None, computed from this split.
         """
         self.mode = mode
         self.img_size = img_size
@@ -79,9 +86,23 @@ class AltitudeDataset(Dataset):
 
         self.indices = train_idx if mode == "train" else val_idx
 
+        # --- Z-score stats for altitude labels ---
+        # Load all altitude values for this split to compute (or receive) mean/std.
+        all_alts = np.array(
+            [float(open(self.alt_files[i]).read().strip()) for i in self.indices],
+            dtype=np.float32,
+        )
+        if alt_mean is None:
+            self.alt_mean = float(all_alts.mean())
+            self.alt_std  = float(all_alts.std()) if all_alts.std() > 0 else 1.0
+        else:
+            self.alt_mean = alt_mean
+            self.alt_std  = alt_std
+
         print(
             f"[AltitudeDataset/{mode}]  {len(train_idx)} train / {len(val_idx)} val  "
-            f"(group_size={group_size}, val_per_group={val_per_group}, seed={random_seed})"
+            f"(group_size={group_size}, val_per_group={val_per_group}, seed={random_seed})  "
+            f"alt_mean={self.alt_mean:.2f} km  alt_std={self.alt_std:.2f} km"
         )
 
         # --- Augmentations (train only) ---
@@ -89,9 +110,7 @@ class AltitudeDataset(Dataset):
         # Because altitude is a scalar property of the satellite orbit, it is
         # completely independent of how the image is oriented or cropped.
         # This means we can freely apply GEOMETRIC transforms (flips, rotations,
-        # crops) in addition to photometric ones — something that was forbidden
-        # in the position pipeline where geometric changes would invalidate the
-        # lat/lon/size labels.
+        # crops) in addition to photometric ones.
         if mode == "train":
             self.augmentations = A.Compose([
                 # --- Geometric (safe because altitude is orientation-invariant) ---
@@ -126,6 +145,9 @@ class AltitudeDataset(Dataset):
         image = cv2.imread(self.img_files[real_idx], cv2.IMREAD_GRAYSCALE)
         image = cv2.resize(image, (self.img_size, self.img_size), interpolation=cv2.INTER_LINEAR)
 
+        # CLAHE contrast enhancement (applied before augmentation)
+        image = _CLAHE.apply(image)
+
         # Apply augmentations
         if self.augmentations is not None:
             image = self.augmentations(image=image)["image"]
@@ -134,10 +156,10 @@ class AltitudeDataset(Dataset):
         image = image.astype(np.float32) / 255.0
         image = np.expand_dims(image, axis=0)
 
-        # Load and normalize altitude to [0, 1]
+        # Load altitude and apply z-score normalization
         with open(self.alt_files[real_idx]) as f:
             altitude_km = float(f.read().strip())
-        altitude_norm = altitude_km / ALT_MAX_KM
+        altitude_norm = (altitude_km - self.alt_mean) / self.alt_std
 
         return (
             torch.from_numpy(image),
@@ -154,20 +176,31 @@ def get_dataloaders(
     random_seed: int = 42,
     num_workers: int = 4,
 ):
-    """Create and return (train_loader, val_loader)."""
+    """
+    Create and return (train_loader, val_loader, alt_mean, alt_std).
+
+    alt_mean / alt_std are computed from the training split and shared with
+    validation so both use the same z-score normalization.
+    """
     shared = dict(
         group_size=group_size,
         val_per_group=val_per_group,
         random_seed=random_seed,
         img_size=img_size,
     )
+    # Train dataset computes its own stats
     train_ds = AltitudeDataset(dataset_root, mode="train", **shared)
-    val_ds   = AltitudeDataset(dataset_root, mode="val",   **shared)
+    # Val dataset reuses training stats so normalization is consistent
+    val_ds   = AltitudeDataset(
+        dataset_root, mode="val",
+        alt_mean=train_ds.alt_mean, alt_std=train_ds.alt_std,
+        **shared,
+    )
 
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,  num_workers=num_workers, pin_memory=True)
     val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
 
-    return train_loader, val_loader
+    return train_loader, val_loader, train_ds.alt_mean, train_ds.alt_std
 
 
 # --- Quick sanity check ---
@@ -177,10 +210,11 @@ if __name__ == "__main__":
     if not os.path.exists(ROOT):
         print(f"Path not found: {ROOT}")
     else:
-        train_loader, val_loader = get_dataloaders(ROOT, batch_size=4)
+        train_loader, val_loader, alt_mean, alt_std = get_dataloaders(ROOT, batch_size=4)
+        train_loader, val_loader, alt_mean, alt_std = get_dataloaders(ROOT, batch_size=4)
         images, altitudes = next(iter(train_loader))
 
         print("✅  Dataloader OK")
-        print(f"   Image shape : {images.shape}")      # (4, 1, 224, 224)
-        print(f"   Altitude    : {altitudes}")          # (4,) in [0, 1]
-        print(f"   Alt (km)    : {altitudes * ALT_MAX_KM}")
+        print(f"   Image shape   : {images.shape}")           # (4, 1, 224, 224)
+        print(f"   Altitude (z)  : {altitudes}")              # z-score values
+        print(f"   Alt (km)      : {altitudes * alt_std + alt_mean}")

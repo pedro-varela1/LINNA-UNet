@@ -2,24 +2,30 @@
 Evaluation metrics for altitude-only prediction.
 
 Expected tensor format:
-    preds   (B,) — normalized altitude in [0, 1]  (model output)
-    targets (B,) — normalized altitude in [0, 1]  (ground truth)
+    preds   (B,) — z-score normalized altitude  (model output)
+    targets (B,) — z-score normalized altitude  (ground truth)
 
-Multiply by ALT_MAX_KM (120 km) to recover physical values.
+Pass alt_mean and alt_std (km) to recover physical values.
 """
 
 import torch
 
-ALT_MAX_KM = 120.0
 
-
-def compute_metrics(preds: torch.Tensor, targets: torch.Tensor, threshold_km: float = 5.0) -> dict:
+def compute_metrics(
+    preds: torch.Tensor,
+    targets: torch.Tensor,
+    alt_mean: float,
+    alt_std:  float,
+    threshold_km: float = 5.0,
+) -> dict:
     """
     Compute altitude prediction metrics for a batch.
 
     Args:
-        preds        : Normalized model predictions  (B,) in [0, 1].
-        targets      : Normalized ground truth       (B,) in [0, 1].
+        preds        : Z-score model predictions  (B,).
+        targets      : Z-score ground truth       (B,).
+        alt_mean     : Training-set mean altitude (km) used for z-score.
+        alt_std      : Training-set std  altitude (km) used for z-score.
         threshold_km : Error threshold (km) used to compute accuracy.
 
     Returns:
@@ -29,8 +35,8 @@ def compute_metrics(preds: torch.Tensor, targets: torch.Tensor, threshold_km: fl
             accuracy_percent— % of samples with |error| < threshold_km.
             threshold_used_km
     """
-    pred_km = preds   * ALT_MAX_KM
-    targ_km = targets * ALT_MAX_KM
+    pred_km = preds   * alt_std + alt_mean
+    targ_km = targets * alt_std + alt_mean
 
     abs_error = torch.abs(pred_km - targ_km)
 
@@ -50,11 +56,12 @@ def compute_metrics(preds: torch.Tensor, targets: torch.Tensor, threshold_km: fl
 if __name__ == "__main__":
     print("🧪  Testing compute_metrics...")
 
-    # Simulate a batch: ground truth at 50 km, predictions slightly off
-    targets = torch.full((8,), 50.0 / ALT_MAX_KM)
-    preds   = targets + torch.randn(8) * (3.0 / ALT_MAX_KM)  # ±3 km noise
+    # Simulate z-score labels: mean=60 km, std=30 km, true altitude=50 km
+    ALT_MEAN, ALT_STD = 60.0, 30.0
+    targets = torch.full((8,), (50.0 - ALT_MEAN) / ALT_STD)
+    preds   = targets + torch.randn(8) * (3.0 / ALT_STD)  # ±3 km noise
 
-    m = compute_metrics(preds, targets, threshold_km=5.0)
+    m = compute_metrics(preds, targets, alt_mean=ALT_MEAN, alt_std=ALT_STD, threshold_km=5.0)
 
     print(f"   MAE       : {m['mae_km']:.2f} km")
     print(f"   RMSE      : {m['rmse_km']:.2f} km")
