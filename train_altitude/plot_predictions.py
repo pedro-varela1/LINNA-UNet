@@ -17,6 +17,8 @@ import random
 import cv2
 import numpy as np
 import torch
+import matplotlib
+matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as FancyBboxPatch
 from matplotlib.patches import FancyArrowPatch
@@ -30,7 +32,7 @@ from model import AltitudeMobileNet
 CHECKPOINT_PATH = "./checkpoints/best_model.pth"   # <-- set your checkpoint here
 DATASET_ROOT    = "../../LINNA-Crater/LunarLanding_Dataset/LunarLanding_Dataset"
 IMG_SIZE        = 224
-RANDOM_SEED     = 7       # change to pick different samples
+RANDOM_SEED     = 9       # change to pick different samples
 N_EXAMPLES      = 3
 TOLERANCE_KM     = 5.0     # for coloring the error in the result block
 DEVICE          = "cuda" if torch.cuda.is_available() else "cpu"
@@ -43,10 +45,10 @@ def load_model(checkpoint_path: str, device: str) -> tuple:
     """Load model and z-score stats from checkpoint."""
     ckpt = torch.load(checkpoint_path, map_location=device)
     model = AltitudeMobileNet().to(device)
-    model.load_state_dict(ckpt["model_state_dict"])
+    model.load_state_dict(ckpt)
     model.eval()
-    alt_mean = float(ckpt["alt_mean"])
-    alt_std  = float(ckpt["alt_std"])
+    alt_mean = 41.35
+    alt_std  = 12.43
     return model, alt_mean, alt_std
 
 
@@ -247,8 +249,8 @@ def main():
 
     plt.savefig("prediction_examples.png", dpi=150, bbox_inches="tight",
                 facecolor=fig.get_facecolor())
-    plt.show()
     print("Saved: prediction_examples.png")
+    plt.show()
 
 
 if __name__ == "__main__":
